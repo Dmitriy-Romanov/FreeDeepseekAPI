@@ -206,9 +206,9 @@ const MODEL_CONFIGS = {
         supported: true,
     },
     'deepseek-v4-pro': {
-        model_type: 'expert', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Эксперт” (exposed as deepseek-v4-pro alias)',
-        capabilities: { reasoning: false, web_search: false, files: false },
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek Web “Эксперт” + thinking mode (exposed as deepseek-v4-pro alias)',
+        capabilities: { reasoning: true, web_search: false, files: false },
         supported: true,
     },
     'deepseek-expert-search': {

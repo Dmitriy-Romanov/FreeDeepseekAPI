@@ -158,7 +158,7 @@ Tool calling принимает OpenAI tools, Anthropic tools и Responses funct
 - `deepseek-reasoner-search` — reasoning + web search
 - `deepseek-r1-search` — совместимый alias на reasoning + web search
 - `deepseek-expert` — DeepSeek Web `Эксперт`, без web search
-- `deepseek-v4-pro` — alias на Web `Эксперт`
+- `deepseek-v4-pro` — Web `Эксперт` + reasoning (`thinking_enabled=true`)
 
 Полный маппинг:
 
@@ -171,7 +171,7 @@ curl http://localhost:9655/v1/model-capabilities
 Текущий вывод DeepSeek Web remote config показывает такие web-режимы:
 
 - `default` / UI `Быстрый` — работает; поддерживает `thinking_enabled` и `search_enabled`.
-- `expert` / UI `Эксперт` — работает через актуальный web-контракт (`x-client-version=2.0.0`). В `/v1/models` выдаются `deepseek-expert` и alias `deepseek-v4-pro`. Search для Expert по remote config недоступен, поэтому `deepseek-expert-search` остаётся unsupported.
+- `expert` / UI `Эксперт` — работает через актуальный web-контракт (`x-client-version=2.0.0`) и поддерживает `thinking_enabled`. В `/v1/models` выдаются `deepseek-expert` без reasoning и `deepseek-v4-pro` как Expert + reasoning. Search для Expert по remote config недоступен, поэтому `deepseek-expert-search` остаётся unsupported.
 - `vision` / UI `Распознавание` — виден в remote config, но сейчас direct Web API возвращает `backend_err_by_model` (`Vision is temporarily unavailable`). Поэтому `deepseek-vision` тоже скрыт из `/v1/models`.
 
 ## Endpoints
