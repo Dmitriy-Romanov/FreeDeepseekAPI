@@ -465,6 +465,7 @@ function formatToolDefinitions(tools) {
     text += '4. After the tool executes, the result will be sent to you as a new user/tool message\n';
     text += '5. Never add explanation before or after the tool request when requesting a tool\n';
     text += '6. Keep arguments compact. Do not include large file contents unless the tool schema requires it.\n\n';
+    text += '7. If the user asks for current, external, recent, web, internet, news, model-release, benchmark, paper, repository, or product information, request an available web search/fetch tool before answering from memory.\n\n';
     text += 'Available functions:\n';
     for (const tool of tools) {
         if (tool.type === 'function' && tool.function) {
@@ -601,6 +602,9 @@ function parseToolCall(text, tools = []) {
         if (toolNames.size === 0 || toolNames.has(name)) return name;
         const aliases = {
             Bash: ['mcp__workspace__bash'],
+            Search: ['WebSearch', 'mcp__workspace__web_fetch'],
+            WebSearch: ['WebSearch', 'mcp__workspace__web_fetch'],
+            GoogleSearch: ['WebSearch', 'mcp__workspace__web_fetch'],
             WebFetch: ['mcp__workspace__web_fetch'],
             Fetch: ['mcp__workspace__web_fetch'],
             web_fetch: ['mcp__workspace__web_fetch'],
