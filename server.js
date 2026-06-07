@@ -536,18 +536,19 @@ function parseToolArgumentsObject(raw) {
     }
 }
 
-function parseJsonToolCandidate(raw, label = 'json', isAllowedToolName = () => true) {
+function parseJsonToolCandidate(raw, label = 'json', resolveToolName = (name) => name) {
     if (!raw) return null;
     try {
         const parsed = parseToolArgumentsObject(raw);
         const tc = coerceToolCallObject(parsed);
         if (tc) {
-            if (!isAllowedToolName(tc.name)) {
-                console.log(`[parseToolCall] ${label}:${tc.name} ignored because it is not in provided tools`);
+            const resolvedName = resolveToolName(tc.name, true);
+            if (!resolvedName) {
                 return null;
             }
-            console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
-            return tc;
+            if (resolvedName !== tc.name) console.log(`[parseToolCall] ${tc.name} mapped to ${resolvedName}`);
+            console.log(`[parseToolCall] SUCCESS ${label}: ${resolvedName} (args=${tc.arguments.length} chars)`);
+            return { ...tc, name: resolvedName };
         }
     } catch (e) {
         console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
@@ -562,14 +563,15 @@ function getToolNames(tools = []) {
     }).filter(Boolean));
 }
 
-function parseFunctionStyleToolCall(text, isAllowedToolName, label = 'function-call') {
+function parseFunctionStyleToolCall(text, resolveToolName, label = 'function-call') {
     // Claude-style shorthand sometimes produced by reasoning models:
     // Bash({"command":"ls"}) or SomeTool({ ... }).
     const functionCallRe = /(^|[^A-Za-z0-9_])([A-Za-z_][\w.-]*)\s*\(/g;
     let fnMatch;
     while ((fnMatch = functionCallRe.exec(text)) !== null) {
         const name = fnMatch[2];
-        if (!isAllowedToolName(name)) continue;
+        const resolvedName = resolveToolName(name, false);
+        if (!resolvedName) continue;
         const openParenIdx = functionCallRe.lastIndex - 1;
         const afterParen = text.substring(openParenIdx + 1);
         const braceIdx = afterParen.indexOf('{');
@@ -581,8 +583,9 @@ function parseFunctionStyleToolCall(text, isAllowedToolName, label = 'function-c
         }
         try {
             const args = parseToolArgumentsObject(rawJson);
-            console.log(`[parseToolCall] SUCCESS ${label}: ${name} (args=${rawJson.length} chars)`);
-            return { name, arguments: JSON.stringify(args) };
+            if (resolvedName !== name) console.log(`[parseToolCall] ${name} mapped to ${resolvedName}`);
+            console.log(`[parseToolCall] SUCCESS ${label}: ${resolvedName} (args=${rawJson.length} chars)`);
+            return { name: resolvedName, arguments: JSON.stringify(args) };
         } catch (e) {
             console.log(`[parseToolCall] ${name}(...) JSON.parse failed: ${e.message.substring(0, 100)}`);
         }
@@ -594,17 +597,26 @@ function parseToolCall(text, tools = []) {
     if (!text || typeof text !== 'string') return null;
     const toolNames = getToolNames(tools);
     const availableToolsText = () => toolNames.size ? Array.from(toolNames).join(', ') : '(no tool filter)';
-    const isAllowedToolName = (name) => {
-        const allowed = toolNames.size === 0 || toolNames.has(name);
-        if (!allowed) console.log(`[parseToolCall] ${name} is not in provided tools. Available: ${availableToolsText()}`);
-        return allowed;
+    const resolveToolName = (name, logUnknown = true) => {
+        if (toolNames.size === 0 || toolNames.has(name)) return name;
+        const aliases = {
+            Bash: ['mcp__workspace__bash'],
+            WebFetch: ['mcp__workspace__web_fetch'],
+            Fetch: ['mcp__workspace__web_fetch'],
+            web_fetch: ['mcp__workspace__web_fetch'],
+        };
+        for (const candidate of aliases[name] || []) {
+            if (toolNames.has(candidate)) return candidate;
+        }
+        if (logUnknown) console.log(`[parseToolCall] ${name} is not in provided tools. Available: ${availableToolsText()}`);
+        return null;
     };
 
     // XML-ish wrappers used by some agent prompts.
     const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
     if (xmlMatch) {
         const inner = xmlMatch[1].trim();
-        const tc = parseJsonToolCandidate(inner, 'xml', isAllowedToolName);
+        const tc = parseJsonToolCandidate(inner, 'xml', resolveToolName);
         if (tc) return tc;
     }
 
@@ -615,10 +627,10 @@ function parseToolCall(text, tools = []) {
         const lang = String(fence[1] || '').toLowerCase();
         const inner = fence[2].trim();
         if (!lang || lang === 'json') {
-            const tc = parseJsonToolCandidate(inner, 'fenced', isAllowedToolName);
+            const tc = parseJsonToolCandidate(inner, 'fenced', resolveToolName);
             if (tc) return tc;
         } else if (['js', 'javascript', 'ts', 'typescript'].includes(lang)) {
-            const tc = parseFunctionStyleToolCall(inner, isAllowedToolName, `fenced-${lang}`);
+            const tc = parseFunctionStyleToolCall(inner, resolveToolName, `fenced-${lang}`);
             if (tc) return tc;
         }
     }
@@ -627,7 +639,8 @@ function parseToolCall(text, tools = []) {
     const match = text.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
     if (match) {
         const name = match[1];
-        if (!isAllowedToolName(name)) {
+        const resolvedName = resolveToolName(name, true);
+        if (!resolvedName) {
             return null;
         }
         const afterMatch = text.substring(match.index + match[0].length);
@@ -637,8 +650,9 @@ function parseToolCall(text, tools = []) {
             if (rawJson) {
                 try {
                     const args = parseToolArgumentsObject(rawJson);
-                    console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
-                    return { name, arguments: JSON.stringify(args) };
+                    if (resolvedName !== name) console.log(`[parseToolCall] ${name} mapped to ${resolvedName}`);
+                    console.log(`[parseToolCall] SUCCESS legacy: ${resolvedName} (args=${rawJson.length} chars)`);
+                    return { name: resolvedName, arguments: JSON.stringify(args) };
                 } catch (e) {
                     console.log(`[parseToolCall] legacy JSON.parse failed: ${e.message.substring(0,100)}`);
                 }
@@ -650,7 +664,7 @@ function parseToolCall(text, tools = []) {
         }
     }
 
-    const functionStyleToolCall = parseFunctionStyleToolCall(text, isAllowedToolName);
+    const functionStyleToolCall = parseFunctionStyleToolCall(text, resolveToolName);
     if (functionStyleToolCall) return functionStyleToolCall;
 
     // First balanced JSON object in the whole response. Supports:
@@ -659,7 +673,7 @@ function parseToolCall(text, tools = []) {
         if (text[i] !== '{') continue;
         const rawJson = extractBalancedJsonAt(text, i);
         if (!rawJson) continue;
-        const tc = parseJsonToolCandidate(rawJson, 'inline', isAllowedToolName);
+        const tc = parseJsonToolCandidate(rawJson, 'inline', resolveToolName);
         if (tc) return tc;
     }
 
