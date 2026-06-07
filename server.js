@@ -58,6 +58,10 @@ const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+const MAX_TOOL_PROMPT_CHARS = Number(process.env.MAX_TOOL_PROMPT_CHARS || 12000);
+const MAX_TOOL_DESCRIPTION_CHARS = Number(process.env.MAX_TOOL_DESCRIPTION_CHARS || 240);
+const MAX_TOOL_PARAMETERS_CHARS = Number(process.env.MAX_TOOL_PARAMETERS_CHARS || 900);
+const MAX_EMPTY_RETRIES = Number(process.env.MAX_EMPTY_RETRIES || 3);
 
 // === DeepSeek Web API Config — loaded from external config file ===
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
@@ -470,11 +474,20 @@ function formatToolDefinitions(tools) {
     for (const tool of tools) {
         if (tool.type === 'function' && tool.function) {
             const fn = tool.function;
-            text += `\n## ${fn.name}\n`;
-            text += `${fn.description || ''}\n`;
-            if (fn.parameters) {
-                text += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+            let entry = `\n## ${fn.name}\n`;
+            const description = String(fn.description || '');
+            if (description) {
+                entry += `${description.length > MAX_TOOL_DESCRIPTION_CHARS ? description.substring(0, MAX_TOOL_DESCRIPTION_CHARS) + '...' : description}\n`;
             }
+            if (fn.parameters) {
+                const paramsJson = JSON.stringify(fn.parameters);
+                entry += `Parameters: ${paramsJson.length > MAX_TOOL_PARAMETERS_CHARS ? paramsJson.substring(0, MAX_TOOL_PARAMETERS_CHARS) + '...' : paramsJson}\n`;
+            }
+            if (text.length + entry.length > MAX_TOOL_PROMPT_CHARS) {
+                text += `\n... ${tools.length} tools total; tool list truncated to ${MAX_TOOL_PROMPT_CHARS} chars. Use the exact function names shown above.\n`;
+                break;
+            }
+            text += entry;
         }
     }
     text += '\n--- END TOOL REQUEST SYSTEM ---\n';
@@ -1262,6 +1275,7 @@ const server = http.createServer(async (req, res) => {
                 : `${historyPrefix}${prompt}`;
 
             const startTime = Date.now();
+            console.log(`${agentTag} Prompt ${fullPrompt.length} chars (system=${systemPrompt.length}, tools=${tools.length}, api=${apiMode})`);
             if (modelResolution.alias) {
                 console.log(`${agentTag} Model alias ${requestedModel} -> ${backendModel} via ${modelResolution.alias}`);
             }
@@ -1380,7 +1394,7 @@ const server = http.createServer(async (req, res) => {
 
             // Empty response — retry loop with fresh sessions
             let retryAttempt = 0;
-            const MAX_RETRIES = 10;
+            const MAX_RETRIES = MAX_EMPTY_RETRIES;
             while (!fullContent || fullContent.trim().length === 0) {
                 retryAttempt++;
                 if (retryAttempt > MAX_RETRIES) {
