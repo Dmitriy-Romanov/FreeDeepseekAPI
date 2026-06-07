@@ -62,6 +62,7 @@ const MAX_TOOL_PROMPT_CHARS = Number(process.env.MAX_TOOL_PROMPT_CHARS || 12000)
 const MAX_TOOL_DESCRIPTION_CHARS = Number(process.env.MAX_TOOL_DESCRIPTION_CHARS || 240);
 const MAX_TOOL_PARAMETERS_CHARS = Number(process.env.MAX_TOOL_PARAMETERS_CHARS || 900);
 const MAX_EMPTY_RETRIES = Number(process.env.MAX_EMPTY_RETRIES || 3);
+const MAX_CLIENT_SYSTEM_CHARS = Number(process.env.MAX_CLIENT_SYSTEM_CHARS || 20000);
 
 // === DeepSeek Web API Config — loaded from external config file ===
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
@@ -1108,14 +1109,23 @@ function extractScreenshotPaths(messages) {
     return paths;
 }
 
+function truncateMiddle(text, maxChars, label = 'content') {
+    const value = String(text || '');
+    if (!maxChars || value.length <= maxChars) return value;
+    const headChars = Math.max(0, Math.floor(maxChars * 0.7));
+    const tailChars = Math.max(0, maxChars - headChars);
+    return `${value.substring(0, headChars)}\n\n[${label} truncated: ${value.length} -> ${maxChars} chars]\n\n${value.substring(value.length - tailChars)}`;
+}
+
 function formatMessages(messages, tools) {
-    let systemPrompt = '';
+    let clientSystemPrompt = '';
     for (const msg of messages) {
         if (msg.role === 'system' && msg.content) {
-            systemPrompt += msg.content + '\n';
+            clientSystemPrompt += msg.content + '\n';
         }
     }
-    systemPrompt += formatToolDefinitions(tools);
+    const systemPrompt = truncateMiddle(clientSystemPrompt, MAX_CLIENT_SYSTEM_CHARS, 'client system prompt')
+        + formatToolDefinitions(tools);
 
     // Build full conversation history for DeepSeek's context
     let conversation = '';
