@@ -71,6 +71,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - **Reasoning output:** отдельный `reasoning_content` для thinking-моделей
 - **Tool calling:** парсинг OpenAI tools, Anthropic tools и Responses function tools
 - **Model capabilities:** `GET /v1/model-capabilities` с alias → real web mode
+- **Model aliases:** Claude/LiteLLM/Bifrost-style имена моделей можно route'ить в DeepSeek aliases
 - **Agent sessions:** отдельная DeepSeek-сессия на `user` / agent id
 - **Session recovery:** авто-сброс устаревших chains/sessions
 - **Zero dependencies:** Node.js 18+, без npm-зависимостей
@@ -255,6 +256,43 @@ FreeDeepseekAPI принимает:
 | `deepseek-r1-search` | `Быстрый` / `default` | да | да | R1-compatible + search |
 | `deepseek-expert` | `Эксперт` / `expert` | нет | нет | Expert mode |
 | `deepseek-v4-pro` | `Эксперт` / `expert` | да | нет | Expert + reasoning |
+
+### Claude-compatible aliases
+
+Для клиентов, которые ожидают Claude-style имена моделей, proxy дополнительно принимает:
+
+| Alias | Route |
+| --- | --- |
+| `claude-sonnet-4-5` | `deepseek-chat` |
+| `anthropic/claude-sonnet-4-5` | `deepseek-chat` |
+| `anthropic/claude-*` | `deepseek-chat` |
+| `claude-*` | `deepseek-chat` |
+
+Например, такой запрос пойдёт в DeepSeek chat mode, а в ответе сохранит `model: "claude-sonnet-4-5"`:
+
+```bash
+curl -X POST http://localhost:9655/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Ответь ровно OK"}],
+    "stream": false
+  }'
+```
+
+Свои aliases можно задать через `MODEL_ALIASES` или `DEEPSEEK_MODEL_ALIASES`:
+
+```bash
+MODEL_ALIASES='{"openrouter/anthropic/claude-*":"deepseek-reasoner","my-fast-model":"deepseek-chat"}' npm start
+```
+
+Для Claude Code и других tool-heavy Anthropic-клиентов дефолтный route использует `deepseek-chat`, потому что DeepSeek thinking mode чаще отдаёт пустой `RESPONSE` в tool loop. Если нужен reasoning, переопределите alias через `MODEL_ALIASES`.
+
+Также поддерживается короткий CSV-формат:
+
+```bash
+MODEL_ALIASES='my-claude=deepseek-reasoner,my-fast=deepseek-chat' npm start
+```
 
 Полный маппинг:
 

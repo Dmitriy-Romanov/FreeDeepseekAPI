@@ -227,7 +227,55 @@ const MODEL_CONFIGS = {
     },
 };
 
-const SUPPORTED_MODEL_IDS = Object.keys(MODEL_CONFIGS).filter(id => MODEL_CONFIGS[id].supported);
+const DEFAULT_MODEL_ALIASES = {
+    // Claude-compatible aliases for Anthropic/LiteLLM/Bifrost/OpenRouter-style clients.
+    // Tool-heavy Claude clients are more reliable with non-thinking mode; reasoning aliases
+    // can still be configured with MODEL_ALIASES when desired.
+    'claude-sonnet-4-5': 'deepseek-chat',
+    'anthropic/claude-sonnet-4-5': 'deepseek-chat',
+    'anthropic/claude-*': 'deepseek-chat',
+    'claude-*': 'deepseek-chat',
+};
+
+function normalizeModelId(model) {
+    return String(model || 'deepseek-chat').trim().toLowerCase();
+}
+
+function parseModelAliasesEnv() {
+    const raw = process.env.MODEL_ALIASES || process.env.DEEPSEEK_MODEL_ALIASES || '';
+    if (!raw.trim()) return {};
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch (e) {}
+    return Object.fromEntries(raw.split(',').map(pair => {
+        const [alias, target] = pair.split('=').map(s => s && s.trim()).filter(Boolean);
+        return alias && target ? [alias, target] : null;
+    }).filter(Boolean));
+}
+
+function wildcardToRegExp(pattern) {
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    return new RegExp(`^${escaped}$`);
+}
+
+const MODEL_ALIAS_MAP = Object.fromEntries(Object.entries({
+    ...DEFAULT_MODEL_ALIASES,
+    ...parseModelAliasesEnv(),
+}).map(([alias, target]) => [normalizeModelId(alias), normalizeModelId(target)]));
+
+const MODEL_ALIAS_RULES = Object.entries(MODEL_ALIAS_MAP).map(([alias, target]) => ({
+    alias,
+    target,
+    exact: !alias.includes('*'),
+    regex: alias.includes('*') ? wildcardToRegExp(alias) : null,
+}));
+
+const EXPOSED_MODEL_IDS = [
+    ...Object.keys(MODEL_CONFIGS),
+    ...MODEL_ALIAS_RULES.filter(rule => rule.exact).map(rule => rule.alias),
+];
+const SUPPORTED_MODEL_IDS = EXPOSED_MODEL_IDS.filter(id => isSupportedModel(id));
 const ALL_MODEL_CAPABILITIES = Object.fromEntries(Object.entries(MODEL_CONFIGS).map(([id, cfg]) => [id, {
     id,
     real_model: cfg.real_model,
@@ -239,12 +287,58 @@ const ALL_MODEL_CAPABILITIES = Object.fromEntries(Object.entries(MODEL_CONFIGS).
     unavailable_reason: cfg.unavailable_reason || null,
 }]));
 
-function resolveModelConfig(model) {
-    const requested = String(model || 'deepseek-chat').toLowerCase();
-    return MODEL_CONFIGS[requested] || MODEL_CONFIGS['deepseek-chat'];
+for (const rule of MODEL_ALIAS_RULES) {
+    const cfg = MODEL_CONFIGS[rule.target];
+    if (!cfg) continue;
+    ALL_MODEL_CAPABILITIES[rule.alias] = {
+        id: rule.alias,
+        alias_for: rule.target,
+        pattern: !rule.exact,
+        real_model: cfg.real_model,
+        model_type: cfg.model_type,
+        thinking_enabled: cfg.thinking_enabled,
+        search_enabled: cfg.search_enabled,
+        capabilities: cfg.capabilities,
+        supported: cfg.supported,
+        unavailable_reason: cfg.unavailable_reason || null,
+    };
 }
-function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
+
+function resolveModelId(model) {
+    const requested = normalizeModelId(model);
+    if (Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, requested)) {
+        return { requested, target: requested, alias: null };
+    }
+    const exactAlias = MODEL_ALIAS_RULES.find(rule => rule.exact && rule.alias === requested);
+    if (exactAlias) return { requested, target: exactAlias.target, alias: exactAlias.alias };
+    const patternAlias = MODEL_ALIAS_RULES.find(rule => !rule.exact && rule.regex.test(requested));
+    if (patternAlias) return { requested, target: patternAlias.target, alias: patternAlias.alias };
+    return { requested, target: requested, alias: null };
+}
+
+function resolveModelConfig(model) {
+    const resolved = resolveModelId(model);
+    return MODEL_CONFIGS[resolved.target] || MODEL_CONFIGS['deepseek-chat'];
+}
+function isKnownModel(model) {
+    const resolved = resolveModelId(model);
+    return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, resolved.target);
+}
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
+function buildModelListEntry(id) {
+    const resolved = resolveModelId(id);
+    const cfg = resolveModelConfig(id);
+    const entry = {
+        id,
+        object: 'model',
+        created: 1700000000,
+        owned_by: resolved.alias ? 'deepseek-web-alias' : 'deepseek-web',
+        real_model: cfg.real_model,
+        capabilities: cfg.capabilities,
+    };
+    if (resolved.alias) entry.alias_for = resolved.target;
+    return entry;
+}
 
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     const modelCfg = resolveModelConfig(model);
@@ -362,7 +456,7 @@ function formatToolDefinitions(tools) {
     text += 'You are an AI that ONLY REASONS and REQUESTS tool executions. You do NOT run any commands yourself.\n';
     text += 'When you need data from the local server, REQUEST exactly one tool call. Prefer strict JSON:\n';
     text += '{"tool_call":{"name":"<function_name>","arguments":{...}}}\n\n';
-    text += 'Legacy format is also accepted: TOOL_CALL: <function_name>\narguments: <JSON arguments>\n\n';
+    text += 'Legacy formats are also accepted: TOOL_CALL: <function_name>\narguments: <JSON arguments>, or <function_name>({ ... }).\n\n';
     text += 'Your response will be sent to the local gateway, which executes the command and sends the output back in the next message.\n\n';
     text += 'RULES:\n';
     text += '1. You ONLY output the tool request — you never run anything yourself\n';
@@ -383,7 +477,7 @@ function formatToolDefinitions(tools) {
         }
     }
     text += '\n--- END TOOL REQUEST SYSTEM ---\n';
-    text += '\nREMEMBER: Request tools only with strict JSON or TOOL_CALL legacy format. Never simulate results.';
+    text += '\nREMEMBER: Request tools only with strict JSON, TOOL_CALL, or function_name({...}) format. Never simulate results.';
     return text;
 }
 
@@ -409,10 +503,14 @@ function extractBalancedJsonAt(text, startIndex) {
 
 function coerceToolCallObject(obj) {
     if (!obj || typeof obj !== 'object') return null;
+    if (typeof obj.tool === 'string') {
+        const args = obj.arguments ?? obj.input ?? obj.parameters ?? {};
+        return { name: obj.tool, arguments: JSON.stringify(args && typeof args === 'object' && !Array.isArray(args) ? args : { value: args }) };
+    }
     const candidate = obj.tool_call || obj.tool || obj.function_call || obj;
     if (!candidate || typeof candidate !== 'object') return null;
     const fn = candidate.function && typeof candidate.function === 'object' ? candidate.function : candidate;
-    const name = fn.name || candidate.name || obj.name;
+    const name = fn.name || candidate.name || obj.name || obj.tool_name;
     let args = fn.arguments ?? candidate.arguments ?? candidate.input ?? obj.arguments ?? obj.input ?? {};
     if (!name || typeof name !== 'string') return null;
     if (typeof args === 'string') {
@@ -422,12 +520,32 @@ function coerceToolCallObject(obj) {
     return { name, arguments: JSON.stringify(args) };
 }
 
-function parseJsonToolCandidate(raw, label = 'json') {
+function parseToolArgumentsObject(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch (strictError) {
+        const relaxed = raw
+            .replace(/([{,]\s*)([A-Za-z_$][\w$.-]*)(\s*:)/g, '$1"$2"$3')
+            .replace(/,\s*([}\]])/g, '$1');
+        try {
+            return JSON.parse(relaxed);
+        } catch (relaxedError) {
+            relaxedError.message = `${relaxedError.message}; strict parse was: ${strictError.message}`;
+            throw relaxedError;
+        }
+    }
+}
+
+function parseJsonToolCandidate(raw, label = 'json', isAllowedToolName = () => true) {
     if (!raw) return null;
     try {
-        const parsed = JSON.parse(raw);
+        const parsed = parseToolArgumentsObject(raw);
         const tc = coerceToolCallObject(parsed);
         if (tc) {
+            if (!isAllowedToolName(tc.name)) {
+                console.log(`[parseToolCall] ${label}:${tc.name} ignored because it is not in provided tools`);
+                return null;
+            }
             console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
             return tc;
         }
@@ -437,36 +555,88 @@ function parseJsonToolCandidate(raw, label = 'json') {
     return null;
 }
 
-function parseToolCall(text) {
+function getToolNames(tools = []) {
+    return new Set((tools || []).map(tool => {
+        if (tool && tool.type === 'function' && tool.function) return tool.function.name;
+        return tool && tool.name;
+    }).filter(Boolean));
+}
+
+function parseFunctionStyleToolCall(text, isAllowedToolName, label = 'function-call') {
+    // Claude-style shorthand sometimes produced by reasoning models:
+    // Bash({"command":"ls"}) or SomeTool({ ... }).
+    const functionCallRe = /(^|[^A-Za-z0-9_])([A-Za-z_][\w.-]*)\s*\(/g;
+    let fnMatch;
+    while ((fnMatch = functionCallRe.exec(text)) !== null) {
+        const name = fnMatch[2];
+        if (!isAllowedToolName(name)) continue;
+        const openParenIdx = functionCallRe.lastIndex - 1;
+        const afterParen = text.substring(openParenIdx + 1);
+        const braceIdx = afterParen.indexOf('{');
+        if (braceIdx === -1) continue;
+        const rawJson = extractBalancedJsonAt(afterParen, braceIdx);
+        if (!rawJson) {
+            console.log(`[parseToolCall] ${name}(...) found but JSON braces are unbalanced`);
+            continue;
+        }
+        try {
+            const args = parseToolArgumentsObject(rawJson);
+            console.log(`[parseToolCall] SUCCESS ${label}: ${name} (args=${rawJson.length} chars)`);
+            return { name, arguments: JSON.stringify(args) };
+        } catch (e) {
+            console.log(`[parseToolCall] ${name}(...) JSON.parse failed: ${e.message.substring(0, 100)}`);
+        }
+    }
+    return null;
+}
+
+function parseToolCall(text, tools = []) {
     if (!text || typeof text !== 'string') return null;
+    const toolNames = getToolNames(tools);
+    const availableToolsText = () => toolNames.size ? Array.from(toolNames).join(', ') : '(no tool filter)';
+    const isAllowedToolName = (name) => {
+        const allowed = toolNames.size === 0 || toolNames.has(name);
+        if (!allowed) console.log(`[parseToolCall] ${name} is not in provided tools. Available: ${availableToolsText()}`);
+        return allowed;
+    };
 
     // XML-ish wrappers used by some agent prompts.
     const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
     if (xmlMatch) {
         const inner = xmlMatch[1].trim();
-        const tc = parseJsonToolCandidate(inner, 'xml');
+        const tc = parseJsonToolCandidate(inner, 'xml', isAllowedToolName);
         if (tc) return tc;
     }
 
-    // Fenced JSON blocks.
-    const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+    // Fenced blocks. Parse JSON fences as objects; parse JS fences for ToolName({...}).
+    const fenceRe = /```([A-Za-z0-9_-]+)?[ \t]*\n?([\s\S]*?)```/g;
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
-        if (tc) return tc;
+        const lang = String(fence[1] || '').toLowerCase();
+        const inner = fence[2].trim();
+        if (!lang || lang === 'json') {
+            const tc = parseJsonToolCandidate(inner, 'fenced', isAllowedToolName);
+            if (tc) return tc;
+        } else if (['js', 'javascript', 'ts', 'typescript'].includes(lang)) {
+            const tc = parseFunctionStyleToolCall(inner, isAllowedToolName, `fenced-${lang}`);
+            if (tc) return tc;
+        }
     }
 
     // Legacy TOOL_CALL: name + first balanced JSON object after it.
     const match = text.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
     if (match) {
         const name = match[1];
+        if (!isAllowedToolName(name)) {
+            return null;
+        }
         const afterMatch = text.substring(match.index + match[0].length);
         const braceIdx = afterMatch.indexOf('{');
         if (braceIdx !== -1) {
             const rawJson = extractBalancedJsonAt(afterMatch, braceIdx);
             if (rawJson) {
                 try {
-                    const args = JSON.parse(rawJson);
+                    const args = parseToolArgumentsObject(rawJson);
                     console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
                     return { name, arguments: JSON.stringify(args) };
                 } catch (e) {
@@ -480,13 +650,16 @@ function parseToolCall(text) {
         }
     }
 
+    const functionStyleToolCall = parseFunctionStyleToolCall(text, isAllowedToolName);
+    if (functionStyleToolCall) return functionStyleToolCall;
+
     // First balanced JSON object in the whole response. Supports:
     // {"tool_call":{"name":"...","arguments":{...}}}, {"name":"...","arguments":{...}}, etc.
     for (let i = 0; i < text.length; i++) {
         if (text[i] !== '{') continue;
         const rawJson = extractBalancedJsonAt(text, i);
         if (!rawJson) continue;
-        const tc = parseJsonToolCandidate(rawJson, 'inline');
+        const tc = parseJsonToolCandidate(rawJson, 'inline', isAllowedToolName);
         if (tc) return tc;
     }
 
@@ -703,7 +876,6 @@ function toAnthropicResponse(openaiResp) {
         },
         watermark: FORGETMEAI_WATERMARK,
     };
-    if (!hasToolCalls && msg.reasoning_content) response.reasoning_content = msg.reasoning_content;
     return response;
 }
 
@@ -732,18 +904,12 @@ function sendAnthropicStream(res, openaiResp) {
         });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage });
     } else {
-        if (msg.reasoning_content) {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[reasoning]\n${msg.reasoning_content}\n[/reasoning]\n` } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-        }
-        const offset = msg.reasoning_content ? 1 : 0;
-        writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
+        writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
         const text = msg.content || '';
         for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
+            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
         }
-        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: offset });
+        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage });
     }
     writeSse(res, 'message_stop', { type: 'message_stop' });
@@ -966,7 +1132,7 @@ const server = http.createServer(async (req, res) => {
     // Models: OpenAI-compatible list exposes only aliases verified to work through this proxy.
     if (req.method === 'GET' && url.pathname === '/v1/models') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ object: 'list', data: SUPPORTED_MODEL_IDS.map(id => ({ id, object: 'model', created: 1700000000, owned_by: 'deepseek-web', real_model: MODEL_CONFIGS[id].real_model, capabilities: MODEL_CONFIGS[id].capabilities })) }));
+        res.end(JSON.stringify({ object: 'list', data: SUPPORTED_MODEL_IDS.map(buildModelListEntry) }));
         return;
     }
 
@@ -1038,16 +1204,18 @@ const server = http.createServer(async (req, res) => {
             const messages = params.messages || [];
             const tools = params.tools || [];
             const stream = params.stream === true;
-            const requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
+            const modelResolution = resolveModelId(params.model || 'deepseek-chat');
+            const requestedModel = modelResolution.requested;
+            const backendModel = modelResolution.target;
             if (!isKnownModel(requestedModel)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: { message: `Unknown model: ${requestedModel}`, type: 'invalid_model', supported_models: SUPPORTED_MODEL_IDS, model_capabilities_url: '/v1/model-capabilities' } }));
                 return;
             }
             if (!isSupportedModel(requestedModel)) {
-                const cfg = resolveModelConfig(requestedModel);
+                const cfg = resolveModelConfig(backendModel);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
+                res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, alias_for: modelResolution.alias ? backendModel : null, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
             // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
@@ -1076,7 +1244,10 @@ const server = http.createServer(async (req, res) => {
                 : `${historyPrefix}${prompt}`;
 
             const startTime = Date.now();
-            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+            if (modelResolution.alias) {
+                console.log(`${agentTag} Model alias ${requestedModel} -> ${backendModel} via ${modelResolution.alias}`);
+            }
+            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, backendModel);
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
@@ -1177,11 +1348,15 @@ const server = http.createServer(async (req, res) => {
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
             const elapsed = Date.now() - startTime;
-            console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
+            if (apiMode === 'anthropic') {
+                console.log(`${agentTag} Got ${fullContent.length} chars in ${elapsed}ms (msg#${session.messageCount})`);
+            } else {
+                console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
+            }
 
             if ((!fullContent || fullContent.trim().length === 0) && modelError) {
                 res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: modelError.content || 'DeepSeek returned an error without content', type: modelError.finish_reason || modelError.type || 'deepseek_model_error', model: requestedModel, real_model: resolveModelConfig(requestedModel).real_model } }));
+                res.end(JSON.stringify({ error: { message: modelError.content || 'DeepSeek returned an error without content', type: modelError.finish_reason || modelError.type || 'deepseek_model_error', model: requestedModel, alias_for: modelResolution.alias ? backendModel : null, real_model: resolveModelConfig(backendModel).real_model } }));
                 return;
             }
 
@@ -1213,7 +1388,7 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
-                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, backendModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
                 const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
@@ -1232,7 +1407,7 @@ const server = http.createServer(async (req, res) => {
                 continuationRounds++;
                 console.log(`${agentTag} Response ${fullContent.length} chars (finish=${finishReason}). Auto-continuing (${continuationRounds}/${MAX_CONTINUATION})...`);
                 await new Promise(r => setTimeout(r, 500));
-                const { resp: contResp } = await askDeepSeekStream('continue', agentId, requestedModel);
+                const { resp: contResp } = await askDeepSeekStream('continue', agentId, backendModel);
                 const contResult = await readDeepSeekResponse(contResp.body);
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
@@ -1247,7 +1422,7 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            let toolCall = parseToolCall(fullContent);
+            let toolCall = parseToolCall(fullContent, tools);
             
             // Retry if TOOL_CALL was found but JSON was truncated/invalid
             if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
@@ -1258,11 +1433,11 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
-                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
+                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, backendModel);
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
-                    const retryTc = parseToolCall(retryContent2);
+                    const retryTc = parseToolCall(retryContent2, tools);
                     if (retryTc) {
                         console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
                         fullContent = retryContent2;
